@@ -48,6 +48,9 @@ class RenderTask:
     """An immutable container for defining a single rendering job."""
     num_renders: int
     random_camera: bool
+    camera_mode: str
+    elevations: Tuple[float, ...]
+    min_elev: float
 
 def reset_scene() -> None:
     """Resets the Blender scene to a clean state by removing all but essential objects."""
@@ -197,10 +200,13 @@ def set_lighting(
 ) -> None:
     """Configures the scene's lighting based on provided arguments."""
     if is_baked:
+        print("Using baked emission shader (vertex colors).")
         set_emission_shader_from_vertex_color()
     elif use_emission_shader:
+        print("Using emission shader (texture/albedo).")
         set_emission_shader_from_texture()
     elif env_map_path:
+        print("Using environment map lighting.")
         load_environment_map(env_map_path)
     else:
         print("Warning: No lighting specified. Scene may be dark.")
@@ -257,14 +263,17 @@ def set_emission_shader_from_texture() -> None:
                 ) and img_node.image:
                     source_image = img_node.image
                     break
-        if not source_image:
-            continue
 
         def setup_texture_emission(node_tree):
             nodes, links = node_tree.nodes, node_tree.links
             nodes.clear()
-            tex_node = nodes.new(type="ShaderNodeTexImage")
-            tex_node.image = source_image
+            tex_node = None
+            if source_image:
+                tex_node = nodes.new(type="ShaderNodeTexImage")
+                tex_node.image = source_image
+            else:
+                tex_node = nodes.new(type="ShaderNodeRGB")
+                tex_node.outputs["Color"].default_value = (0.8, 0.8, 0.8, 1.0)
             emission = nodes.new(type="ShaderNodeEmission")
             output = nodes.new(type="ShaderNodeOutputMaterial")
             links.new(tex_node.outputs["Color"], emission.inputs["Color"])
@@ -316,7 +325,7 @@ def get_camera_positions(
     is what places the camera in front of the object (looking from the
     positive Y direction towards the origin) for a 0-degree azimuth.
     """
-    if task.random_camera:
+    if task.camera_mode == "random":
         for _ in range(task.num_renders):
             azimuth_rad = random.uniform(0, 2 * math.pi)
             elevation_rad = math.asin(random.uniform(-1, 1))
@@ -327,17 +336,25 @@ def get_camera_positions(
 
             yield Vector((x, y, z)), math.degrees(azimuth_rad), math.degrees(elevation_rad)
 
-    else: # Orbit
-        elevation_rad = 0.0
-        for i in range(task.num_renders):
-            azimuth_deg = (360.0 / task.num_renders) * i
-            azimuth_rad = math.radians(azimuth_deg)
+    else:  # Orbit / multi-orbit
+        elevations = task.elevations or (0.0,)
+        clamped_elevations = [max(elev, task.min_elev) for elev in elevations]
+        total_renders = max(task.num_renders, len(clamped_elevations))
+        base_count = max(total_renders // len(clamped_elevations), 1)
+        remainder = total_renders - base_count * len(clamped_elevations)
 
-            x = radius * math.cos(elevation_rad) * math.sin(azimuth_rad)
-            y = -radius * math.cos(elevation_rad) * math.cos(azimuth_rad)
-            z = radius * math.sin(elevation_rad)
+        for ring_index, elevation_deg in enumerate(clamped_elevations):
+            ring_count = base_count + (1 if ring_index < remainder else 0)
+            elevation_rad = math.radians(elevation_deg)
+            for i in range(ring_count):
+                azimuth_deg = (360.0 / ring_count) * i
+                azimuth_rad = math.radians(azimuth_deg)
 
-            yield Vector((x, y, z)), azimuth_deg, 0.0
+                x = radius * math.cos(elevation_rad) * math.sin(azimuth_rad)
+                y = -radius * math.cos(elevation_rad) * math.cos(azimuth_rad)
+                z = radius * math.sin(elevation_rad)
+
+                yield Vector((x, y, z)), azimuth_deg, elevation_deg
 
 
 def setup_camera_and_track(location: Vector, fov_deg: float) -> bpy.types.Object:
@@ -430,14 +447,17 @@ def execute_render_pass(
         if task.num_renders == 0:
             continue
 
-        if task.random_camera:
+        if task.camera_mode == "random":
             task_output_dir = output_dir
             prefix = "train"
             print(f"  - Planning {task.num_renders} random keyframes.")
-        else:  # Orbit
+        else:  # Orbit / multi-orbit
             task_output_dir = output_dir / "orbit"
             prefix = "orbit"
-            print(f"  - Planning {task.num_renders} orbit keyframes.")
+            print(
+                f"  - Planning {task.num_renders} multi-orbit keyframes "
+                f"across elevations {task.elevations}."
+            )
 
         task_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -445,10 +465,10 @@ def execute_render_pass(
         for i, (location, azimuth, elevation) in enumerate(pos_generator):
             cam.location = location
             cam.keyframe_insert(data_path="location", frame=current_frame)
-            if task.random_camera:
+            if task.camera_mode == "random":
                 filename = f"{prefix}_{azimuth:.1f}_{elevation:.1f}.png"
             else:
-                filename = f"{prefix}_{i:03d}.png"
+                filename = f"{prefix}_e{int(round(elevation)):02d}_{i:03d}.png"
             frame_mappings[current_frame] = task_output_dir / filename
             current_frame += 1
 
@@ -545,6 +565,7 @@ def main():
     args = parser.parse_args(argv)
 
     reset_scene()
+    print(f"Emission shader enabled: {args.use_emission_shader}")
     load_object(args.object_path, args.axis_forward, args.axis_up)
     set_lighting(args.env_map_path, args.baked, args.use_emission_shader)
     normalize_scene()
@@ -562,7 +583,19 @@ def main():
 
     tasks: List[RenderTask] = []
     if args.num_renders > 0:
-        tasks.append(RenderTask(args.num_renders, args.random_camera))
+        camera_mode = args.camera_mode
+        if camera_mode is None:
+            camera_mode = "random" if args.random_camera else "multi_orbit"
+        elevations = parse_elevations(args.elevations)
+        tasks.append(
+            RenderTask(
+                args.num_renders,
+                args.random_camera,
+                camera_mode,
+                elevations,
+                args.min_elev,
+            )
+        )
 
     execute_render_pass(tasks, args.output_dir, args.radius, args.fov_deg)
 
