@@ -397,19 +397,6 @@ def matrix_to_list(matrix: Matrix) -> List[List[float]]:
     return [list(map(float, row)) for row in matrix]
 
 
-def parse_elevations(elevations: str) -> Tuple[float, ...]:
-    """Parse a comma-separated list of elevations in degrees."""
-    if not elevations:
-        return ()
-    values = []
-    for entry in elevations.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        values.append(float(entry))
-    return tuple(values)
-
-
 def setup_render_settings(engine: str, resolution: int, samples: int) -> None:
     """Configures global render settings for Blender."""
     _RENDER.engine = engine
@@ -435,11 +422,7 @@ def setup_render_settings(engine: str, resolution: int, samples: int) -> None:
 
 
 def execute_render_pass(
-    tasks: List[RenderTask],
-    output_dir: Path,
-    radius: float,
-    fov_deg: float,
-    camera_model: str,
+    tasks: List[RenderTask], output_dir: Path, radius: float, fov_deg: float
 ) -> None:
     """
     Executes the rendering pass for a list of tasks.
@@ -501,25 +484,14 @@ def execute_render_pass(
     width = _RENDER.resolution_x
     height = _RENDER.resolution_y
     fl_x, fl_y, cx, cy = compute_intrinsics_from_hfov(fov_deg, width, height)
-    opencv_conversion = Matrix(
-        (
-            (1.0, 0.0, 0.0, 0.0),
-            (0.0, -1.0, 0.0, 0.0),
-            (0.0, 0.0, -1.0, 0.0),
-            (0.0, 0.0, 0.0, 1.0),
-        )
-    )
 
     for frame in range(_SCENE.frame_start, _SCENE.frame_end + 1):
         _SCENE.frame_set(frame)
         output_path = frame_mappings[frame]
-        transform_matrix = cam.matrix_world.copy()
-        if camera_model == "OPENCV":
-            transform_matrix = transform_matrix @ opencv_conversion
         frame_exports.setdefault(output_path.parent, []).append(
             {
                 "file_path": output_path.name,
-                "transform_matrix": matrix_to_list(transform_matrix),
+                "transform_matrix": matrix_to_list(cam.matrix_world.copy()),
             }
         )
         _RENDER.filepath = str(output_path)
@@ -531,27 +503,19 @@ def execute_render_pass(
     for export_dir, frames in frame_exports.items():
         frames_sorted = sorted(frames, key=lambda entry: entry["file_path"])
         transforms_path = export_dir / "transforms.json"
-        if camera_model == "OPENCV":
-            payload = {
-                "camera_model": "OPENCV",
-                "fl_x": fl_x,
-                "fl_y": fl_y,
-                "cx": cx,
-                "cy": cy,
-                "w": width,
-                "h": height,
-                "frames": frames_sorted,
-            }
-        else:
-            payload = {
-                "camera_angle_x": math.radians(fov_deg),
-                "w": width,
-                "h": height,
-                "frames": frames_sorted,
-            }
+        payload = {
+            "camera_model": "OPENCV",
+            "fl_x": fl_x,
+            "fl_y": fl_y,
+            "cx": cx,
+            "cy": cy,
+            "w": width,
+            "h": height,
+            "frames": frames_sorted,
+        }
         with transforms_path.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
-        print(f"Saved transforms.json to {transforms_path} (camera_model={camera_model})")
+        print(f"Saved transforms.json to {transforms_path}")
         print(
             "Camera intrinsics: "
             f"fl_x={fl_x:.2f}, fl_y={fl_y:.2f}, cx={cx:.2f}, cy={cy:.2f}, "
@@ -596,33 +560,6 @@ def main():
         default=60.0,
         help="Horizontal field of view in degrees for the perspective camera.",
     )
-    parser.add_argument(
-        "--camera_mode",
-        type=str,
-        choices=["random", "multi_orbit"],
-        default=None,
-        help="Camera sampling mode. Defaults to random if --random_camera is set; "
-        "otherwise uses multi_orbit.",
-    )
-    parser.add_argument(
-        "--elevations",
-        type=str,
-        default="10,25,40,55",
-        help="Comma-separated list of elevation angles (degrees) for multi-orbit sampling.",
-    )
-    parser.add_argument(
-        "--min_elev",
-        type=float,
-        default=5.0,
-        help="Minimum elevation (degrees) to avoid below-horizon views in multi-orbit.",
-    )
-    parser.add_argument(
-        "--camera_model",
-        type=str,
-        choices=["BLENDER", "OPENCV"],
-        default="BLENDER",
-        help="Camera model for transforms.json export.",
-    )
     parser.add_argument("--random_camera", action="store_true")
     parser.add_argument("--baked", action="store_true")
     args = parser.parse_args(argv)
@@ -660,13 +597,7 @@ def main():
             )
         )
 
-    execute_render_pass(
-        tasks,
-        args.output_dir,
-        args.radius,
-        args.fov_deg,
-        args.camera_model,
-    )
+    execute_render_pass(tasks, args.output_dir, args.radius, args.fov_deg)
 
     bpy.ops.object.select_all(action="DESELECT")
     for obj in _SCENE.objects:
