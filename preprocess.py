@@ -6,6 +6,7 @@ It can render images with filenames that encode the camera's azimuth and elevati
 """
 
 import argparse
+import json
 import math
 import random
 import sys
@@ -339,15 +340,16 @@ def get_camera_positions(
             yield Vector((x, y, z)), azimuth_deg, 0.0
 
 
-def setup_camera_and_track(location: Vector) -> bpy.types.Object:
+def setup_camera_and_track(location: Vector, fov_deg: float) -> bpy.types.Object:
     """Positions and configures the scene camera, and makes it track the origin."""
     bpy.ops.object.camera_add(location=location)
     cam = _CONTEXT.active_object
     cam.name = "SceneCamera"
     _SCENE.camera = cam
 
-    cam.data.type = "ORTHO"
-    cam.data.ortho_scale = 1.0
+    cam.data.type = "PERSP"
+    cam.data.sensor_fit = "HORIZONTAL"
+    cam.data.angle = math.radians(fov_deg)
 
     bpy.ops.object.empty_add(type="PLAIN_AXES", location=(0, 0, 0))
     target = _CONTEXT.active_object
@@ -358,6 +360,24 @@ def setup_camera_and_track(location: Vector) -> bpy.types.Object:
     constraint.track_axis = "TRACK_NEGATIVE_Z"
     constraint.up_axis = "UP_Y"
     return cam
+
+
+def compute_intrinsics_from_hfov(
+    fov_deg: float, width: int, height: int
+) -> Tuple[float, float, float, float]:
+    """Compute focal length and principal point from a horizontal field of view."""
+    fov_rad = math.radians(fov_deg)
+    fl_x = 0.5 * width / math.tan(0.5 * fov_rad)
+    fov_y = 2.0 * math.atan(math.tan(0.5 * fov_rad) * (height / width))
+    fl_y = 0.5 * height / math.tan(0.5 * fov_y)
+    cx = width * 0.5
+    cy = height * 0.5
+    return fl_x, fl_y, cx, cy
+
+
+def matrix_to_list(matrix: Matrix) -> List[List[float]]:
+    """Convert a Blender Matrix to a JSON-serializable list of lists."""
+    return [list(map(float, row)) for row in matrix]
 
 
 def setup_render_settings(engine: str, resolution: int, samples: int) -> None:
@@ -385,10 +405,10 @@ def setup_render_settings(engine: str, resolution: int, samples: int) -> None:
 
 
 def execute_render_pass(
-    tasks: List[RenderTask], output_dir: Path, radius: float
+    tasks: List[RenderTask], output_dir: Path, radius: float, fov_deg: float
 ) -> None:
     """
-    Executes the orthographic rendering pass for a list of tasks.
+    Executes the rendering pass for a list of tasks.
 
     Args:
         tasks: A list of RenderTask objects defining the renders.
@@ -398,10 +418,11 @@ def execute_render_pass(
     if not tasks:
         return
 
-    print("\n--- Starting orthographic render pass ---")
+    print("\n--- Starting render pass ---")
 
-    cam = setup_camera_and_track(Vector((0, 0, 0)))
+    cam = setup_camera_and_track(Vector((0, 0, 0)), fov_deg)
     frame_mappings: Dict[int, Path] = {}
+    frame_exports: Dict[Path, List[Dict[str, Any]]] = {}
     current_frame = 1
 
     # This loop will typically only run once, but handles the list structure.
@@ -440,13 +461,50 @@ def execute_render_pass(
     total_frames = len(frame_mappings)
     print(f"Rendering {total_frames} frames via manual loop...")
 
+    width = _RENDER.resolution_x
+    height = _RENDER.resolution_y
+    fl_x, fl_y, cx, cy = compute_intrinsics_from_hfov(fov_deg, width, height)
+
     for frame in range(_SCENE.frame_start, _SCENE.frame_end + 1):
         _SCENE.frame_set(frame)
-        _RENDER.filepath = str(frame_mappings[frame])
-        print(f"Rendering frame {frame}/{total_frames} to {frame_mappings[frame].name}")
+        output_path = frame_mappings[frame]
+        frame_exports.setdefault(output_path.parent, []).append(
+            {
+                "file_path": output_path.name,
+                "transform_matrix": matrix_to_list(cam.matrix_world.copy()),
+            }
+        )
+        _RENDER.filepath = str(output_path)
+        print(f"Rendering frame {frame}/{total_frames} to {output_path.name}")
         bpy.ops.render.render(write_still=True)
 
     print("Manual rendering complete.")
+
+    for export_dir, frames in frame_exports.items():
+        frames_sorted = sorted(frames, key=lambda entry: entry["file_path"])
+        transforms_path = export_dir / "transforms.json"
+        payload = {
+            "camera_model": "OPENCV",
+            "fl_x": fl_x,
+            "fl_y": fl_y,
+            "cx": cx,
+            "cy": cy,
+            "w": width,
+            "h": height,
+            "frames": frames_sorted,
+        }
+        with transforms_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"Saved transforms.json to {transforms_path}")
+        print(
+            "Camera intrinsics: "
+            f"fl_x={fl_x:.2f}, fl_y={fl_y:.2f}, cx={cx:.2f}, cy={cy:.2f}, "
+            f"w={width}, h={height}"
+        )
+        if frames_sorted:
+            first_matrix = frames_sorted[0]["transform_matrix"]
+            translation = [first_matrix[i][3] for i in range(3)]
+            print(f"First frame c2w translation: {translation}")
 
     bpy.ops.object.select_all(action="DESELECT")
     bpy.data.objects[cam.name].select_set(True)
@@ -476,6 +534,12 @@ def main():
     parser.add_argument("--num_renders", type=int, default=100)
     parser.add_argument("--use_emission_shader", action="store_true")
     parser.add_argument("--radius", type=float, default=1.0)
+    parser.add_argument(
+        "--fov_deg",
+        type=float,
+        default=60.0,
+        help="Horizontal field of view in degrees for the perspective camera.",
+    )
     parser.add_argument("--random_camera", action="store_true")
     parser.add_argument("--baked", action="store_true")
     args = parser.parse_args(argv)
@@ -500,7 +564,7 @@ def main():
     if args.num_renders > 0:
         tasks.append(RenderTask(args.num_renders, args.random_camera))
 
-    execute_render_pass(tasks, args.output_dir, args.radius)
+    execute_render_pass(tasks, args.output_dir, args.radius, args.fov_deg)
 
     bpy.ops.object.select_all(action="DESELECT")
     for obj in _SCENE.objects:

@@ -167,8 +167,13 @@ Inputs/3D/MyData/
                 ├── knight_normalized.obj
                 ├── prompt.txt
                 ├── train_0_0.png
+                ├── transforms.json
                 └── ... (many more rendered images)
 ```
+
+The `transforms.json` file is saved alongside the rendered images and contains
+per-frame camera-to-world matrices plus shared intrinsics (`fl_x`, `fl_y`, `cx`,
+`cy`, `w`, `h`). This format is compatible with nerfstudio/SDFStudio loaders.
 ---
 
 ### __Step 2: Model Refinement__
